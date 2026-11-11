@@ -21,6 +21,7 @@ random choices are seeded from the round seed and the image hash.
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import io
 import json
@@ -39,8 +40,8 @@ from openai.types.responses import Response, ResponseInputParam
 from openai.types.responses.response_create_params import ResponseCreateParamsBase
 from witness_client import ExchangePending, RenderOptions, RenderRejected, RenderUnavailable, WitnessError
 
-from . import match, orient, prompts, tilt
-from .budget import CREDIT_LIMIT, PRICING, SAFETY, Budget, worst_case
+from . import match, orient, patch, prompts, tilt
+from .budget import CALL_LIMIT, CREDIT_LIMIT, PRICING, SAFETY, Budget, worst_case
 from .fallback import fallback_module
 from .images import data_url, object_closeup, png_data_url, to_jpeg, view_sheet, zoomed_views
 from .orient import Renderer
@@ -69,11 +70,24 @@ REPAIR_OFFSET = 5000
 SELECT_ID = 9000  # plus 10 * (step + 1); the mirrored call takes the next id
 FINAL_SELECT_ID = 9800
 POSE_ID = 9900
+CHECK_ID = 9950  # the inspector; +10 its rewrite; +20 and +21 the selector's choice
+REVIEW_ID = 9600  # the reviewer before a round that feeds fixes: + 10 * (round index + 1) + lineage
+CRITIQUE_ID = 9400  # the critique of the drafts; + 10 the module merged from them
+CALL_RESERVE = 3  # calls the round planner leaves for the pose choice and one repair
+JUDGE_MAX_OUTPUT = 4096
+JUDGE_DRAW = 0.7  # the judge's own first-stage draw threshold, in mean penalty points
+NARROW_ID = 9870  # with several lineages: the judge-copy choice that keeps one; +1 the mirrored view
+CHECKPOINT_ID = 9880  # the final module against earlier checkpoints: selector (+1 mirrored), then judge copy (+2, +3)
 TILT_SELECT_ID = 9960  # the judged final tilt; the mirrored call takes the next id
 TILT_CHOICES = (0, 20, 40)  # degrees toward the cameras, offered for the finished module
 TILT_MARGIN = 0.25  # mean penalty points a new tilt must gain over the module as finished
+TURN_SELECT_ID = 9970  # the judged final turn; the mirrored call takes the next id
+TURN_CHOICES = (-30, 30)  # degrees about the vertical axis, offered for the finished module after its tilt is settled
 _TILT_LINES = re.compile(r"if \(flat\.y < 0\.5 \* Math\.max\(flat\.x, flat\.z\)\) root\.rotation\.x = 15 \* Math\.PI / 180;"
                          r"|root\.rotation\.x = \d+ \* Math\.PI / 180;")
+CHECK_SEVERITY = 5  # what the inspector must report before the finished module is rewritten
+POST_PICK_STEPS = 3  # rewrites of the final pick (steps 7-9: rewrite 700/800/900, selection 9070/9080/9090)
+POST_PICK_REWRITE = (SOL, "xhigh")  # the rewrite of the plan's last step
 METAL_PASS = 'const __m404 = new Set(); root.traverse((o) => { const list = o.material ? (Array.isArray(o.material) ? o.material : [o.material]) : []; for (const m of list) { if (__m404.has(m)) continue; __m404.add(m); if (m.metalness !== undefined && m.metalness >= 0.25) { m.metalness = 0.8; m.roughness = 0.2; } } });'
 BRIEF_ID = 9990
 BRIEF_MAX_OUTPUT = 4096
@@ -485,7 +499,10 @@ class Candidate:
     match: float = 0.0  # how closely the views match the photo, in measured plans
     measurements: str = ""
     overlay: bytes = b""
+    fixes: list[str] = field(default_factory=list)  # the selector's fixes from the last selection that scored it
+    notes: str = ""  # the model's list of differences, written before its code
     visible_tokens: int = 0  # output tokens of the reply that wrote it, reasoning excluded
+    shots: list[bytes] = field(default_factory=list)  # the two level side views as the judge sees them, uncropped (kept for judge_pick)
 
 
 @dataclass
@@ -523,6 +540,16 @@ class Step:
     keep: int = 0  # survivors the selector keeps of parents and children; 0 = each lineage's newest module, unjudged
     focus: tuple[str, ...] = ()  # keys of prompts.REWRITE_FOCUS, by survivor position
     each_lineage: bool = False  # one selection scores all; every lineage keeps its own child or parent
+    fallback: tuple[str, str] | None = None  # (model, effort) to use instead when the budget would refuse this round's model
+    tie_parent: bool = False  # an exact tie in the selector's score keeps the parent
+    feed_fixes: bool = False  # the rewrite also gets the selector's fixes for its parent
+    feed_history: bool = False  # the rewrite also gets earlier rounds' differences and whether each was kept
+    feed_diffs: bool = False  # the rewrite also gets earlier rounds' real code changes (old and new lines) and whether each was kept
+    patch: bool = False  # the rewrite answers with SEARCH/REPLACE edits applied to the parent's module
+    merge: bool = False  # after the rewrite, one call merges parent and child part by part; the selector sees all three
+    judge_pick: bool = False  # the child is kept unless a copy of the judge's first stage, on the two level side views, prefers the parent
+    pair_merge: bool = False  # each_lineage with two rewrites: one call merges the two children; the selector sees parent, both and the merge
+    nudge: str = ""  # appended to the rewrite text unchanged in meaning, so the round is a fresh draw (a control)
 
 
 @dataclass(frozen=True)
@@ -539,11 +566,25 @@ class StagePlan:
     # Fit the object's real outline, so rotated parts do not shrink it.
     outline_fit: bool = False
     # The same fit, applied only to the finished module: the chain runs without it.
+    check: bool = False  # an inspector lists serious faults of the finished module; a severe list gets one gated rewrite
+    budget_plan: bool = False  # after round 1, cheaper models for later rounds when the forecast cost would not fit
+    plan_rounds: int = 0  # the planner makes only the first N rounds fit; later rounds run when the guard admits them (0 = all)
+    astra_last: bool = False  # the planner lowers Sol xhigh rounds to Sol high first and touches Astra rounds only after them
+    replan: bool = False  # the planner runs before every round from round 2 (see fit_rest): merges, some xhigh, then Astra give way
+    merge_pick: bool = False  # after the draft pick: a critique of every draft, then one module merged from the best base and two others
+    merge_beam: bool = False  # the draft selection also sees one module merged from the drafts (critique, then merge); it must rank to survive
+    checkpoints: tuple[int, ...] = ()  # rounds (1-based) after which the lead module is kept; at the end the final module meets the best of them
+    second_look: bool = False  # pair rounds: when the two best new candidates are within PARENT_MARGIN, the judge copy decides between them
+    merge_tie: bool = False  # pair rounds: the merge is taken when within PARENT_MARGIN of the best new candidate
+    narrow_after: int = 0  # with several lineages: after this round one is kept, the first unless the judge copy clearly prefers another
+    level_tilt: bool = False  # where the photo's outline calls for the 22-degree tilt, only flat objects get it; taller ones stay level
+    tone: bool = False  # the finished module gets slightly more contrast and colour
+    forward: bool = False  # the finished object is moved to the front face of the unit cube
+    judged_tilt: bool = False  # the finished module is offered at other tilts toward the cameras; the pose selector's clear favourite is kept
+    judged_turn: bool = False  # then it is offered turned left and right about the vertical axis, chosen the same way
     outline_fit_last: bool = False
-    # After round 1, later rounds move to cheaper models when the forecast cost would not fit the budget.
-    budget_plan: bool = False
-    # The finished module is offered at other tilts toward the cameras; the pose selector's clear favourite is kept.
-    judged_tilt: bool = False
+    post_pick_effort: str = "xhigh"  # effort of the rewrites of the final pick
+    post_pick_steps: int = POST_PICK_STEPS  # rewrites of the final pick; 0 ends the chain at the pick
 
 
 @dataclass
@@ -592,6 +633,8 @@ class Pipeline:
     def __init__(self, image: bytes, seed: int, calls: ModelCalls, renderer: Renderer) -> None:
         self.image = image
         self.seed = seed
+        self.history: list[tuple[int, str, bool]] = []  # (round, the child's notes, kept)
+        self.changes: list[tuple[int, str, bool]] = []  # (round, the child's changed code lines against its parent, kept)
         self.calls = calls
         self.renderer = PatientRenderer(renderer)
         self.budget = Budget()
@@ -604,28 +647,327 @@ class Pipeline:
         self.astra_cap = ASTRA_MAX_OUTPUT
         self.photo: match.Appearance | None = None
         self.brief = ""
+        self.patch_log: list[dict[str, Any]] = []  # one entry per patch-edit reply
+        self.patch_ratios: list[float] = []  # per patch-edit reply: its visible tokens over the module's (1 for a whole module)
+        self.level_tilt = False
+        self.keep_shots = False  # candidates keep their uncropped side views for judge_pick
+        self.second_look = False
+        self.merge_tie = False
+        self.end_reserve = 0.0  # credits the round planner leaves for the selection after the last round
+        self.merge_base = ""  # the draft the merged draft was built on
 
     # ----- model calls -----
 
+    def merge_two_call(self, request_id: int, first: Candidate, second: Candidate) -> Call:
+        """One module from two rewrites of the same parent, keeping each part from whichever matches the target better."""
+        image = lambda b: {"type": "input_image", "image_url": data_url(b), "detail": "high"}
+        return self.module_call(request_id, SOL, "high", [
+            {"type": "input_text", "text": "REWRITE A: close-ups from the judge's four front cameras (30 degrees left, 30 degrees right, from slightly below, from above), then its grid:"},
+            *[image(v) for v in first.views], image(first.sides),
+            {"type": "input_text", "text": "REWRITE B: the same views:"},
+            *[image(v) for v in second.views], image(second.sides),
+            {"type": "input_text", "text": prompts.MERGE_TWO.format(first=first.raw, second=second.raw)}])
+
+    def beam_merge(self, pool: ThreadPoolExecutor, candidates: list[Candidate], request_id: int, name: str) -> Candidate | None:
+        """A critique of the candidates against the target, then one module merged from the best base and the two others
+        with the most strengths (as in the draft merge pick). None when there is nothing to merge or no valid module."""
+        if len(candidates) < 2:
+            return None
+        labels = [chr(65 + i) for i in range(len(candidates))]
+        by = dict(zip(labels, candidates, strict=True))
+        image = lambda b: {"type": "input_image", "image_url": data_url(b), "detail": "high"}
+        content: list[dict[str, Any]] = [{"type": "input_text", "text": "TARGET:"}, self.target, *self.closeup]
+        for label, candidate in by.items():
+            content += [{"type": "input_text", "text": f"CANDIDATE {label} FRONT VIEWS:"}, image(candidate.front),
+                        {"type": "input_text", "text": f"CANDIDATE {label} GRID:"}, image(candidate.sides)]
+        content.append({"type": "input_text", "text": prompts.CRITIQUE_USER})
+        reply = self.run_stage(pool, [Call(request_id, SOL, prompts.CRITIQUE_SYSTEM, content, "medium", SELECT_MAX_OUTPUT,
+                                           text=prompts.critique_schema(labels))])[0]
+        try:
+            critique = json.loads(reply.output_text) if reply is not None else None
+            notes = {entry["label"]: entry for entry in critique["candidates"] if entry.get("label") in by}
+            base = critique["base"] if critique.get("base") in by else labels[0]
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return None
+        others = sorted((label for label in labels if label != base), key=lambda label: -len(notes.get(label, {}).get("strengths", [])))[:2]
+
+        def block(label: str, role: str) -> str:
+            note = notes.get(label, {})
+            return (f"{role} MODULE (candidate {label})\nStrengths: " + "; ".join(note.get("strengths", [])) + "\nWeaknesses: "
+                    + "; ".join(note.get("weaknesses", [])) + f"\n```javascript\n{by[label].raw}\n```")
+
+        text = prompts.MERGE_PICK + "\n\n" + block(base, "BASE") + "".join("\n\n" + block(label, "OTHER") for label in others)
+        call = Call(request_id + 10, SOL, self.instructions, [{"type": "input_text", "text": text}, self.target, *self.closeup],
+                    "high", GENERATE_MAX_OUTPUT)
+        merged = self.modules(pool, [call], [name])[0]
+        if merged is not None:
+            merged.parent = by[base]
+        return merged
+
+    def merge_call(self, request_id: int, parent: Candidate, child: Candidate) -> Call:
+        """One module from the parent and its rewrite, keeping each part from whichever matches the target better."""
+        image = lambda b: {"type": "input_image", "image_url": data_url(b), "detail": "high"}
+        return self.module_call(request_id, SOL, "high", [
+            {"type": "input_text", "text": "CURRENT version: close-ups from the judge's four front cameras (30 degrees left, 30 degrees right, from slightly below, from above), then its grid:"},
+            *[image(v) for v in parent.views], image(parent.sides),
+            {"type": "input_text", "text": "NEW version (its latest rewrite): the same views:"},
+            *[image(v) for v in child.views], image(child.sides),
+            {"type": "input_text", "text": prompts.MERGE_ROUND.format(current=parent.raw, new=child.raw)}])
+
+    def reviewed(self, pool: ThreadPoolExecutor, module: Candidate, request_id: int) -> list[str]:
+        """A reviewer's concrete fixes for one module against the target (the round selector does not write any)."""
+        if not module.views:
+            return []
+        views = [{"type": "input_image", "image_url": data_url(view), "detail": "high"} for view in module.views]
+        content = [self.target, *views, {"type": "input_image", "image_url": data_url(module.sides), "detail": "high"},
+                   {"type": "input_text", "text": prompts.REVIEW_USER}]
+        call = Call(request_id, SOL, prompts.REVIEW_SYSTEM, content, SELECT_EFFORT, SELECT_MAX_OUTPUT, text=prompts.review_schema())
+        reply = self.run_stage(pool, [call])[0]
+        try:
+            return [str(f) for f in json.loads(reply.output_text).get("fixes", [])][:6] if reply is not None else []
+        except (ValueError, TypeError, AttributeError):
+            return []
+
+    def checked(self, pool: ThreadPoolExecutor, winner: Candidate) -> Candidate:
+        """An inspector looks at the finished module from the judge's front cameras; a serious fault gets one rewrite,
+        which the selector can refuse."""
+        if not winner.raw or not winner.views:
+            return winner
+        views = [{"type": "input_image", "image_url": data_url(view), "detail": "high"} for view in winner.views]
+        call = Call(CHECK_ID, SOL, prompts.CHECK_SYSTEM, [self.target, *views, {"type": "input_text", "text": prompts.CHECK_USER}],
+                    SELECT_EFFORT, SELECT_MAX_OUTPUT, text=prompts.check_schema())
+        reply = self.run_stage(pool, [call])[0]
+        try:
+            found = json.loads(reply.output_text) if reply is not None else {}
+            faults, severity = [str(f) for f in found.get("faults", [])][:6], int(found.get("severity", 0))
+        except (ValueError, TypeError, AttributeError):
+            return winner
+        if not faults or severity < CHECK_SEVERITY:
+            return winner
+        note = prompts.CHECK_NOTE.format(faults="\n".join(f"- {fault}" for fault in faults))
+        child = self.modules(pool, [self.rewrite_call(CHECK_ID + 10, SOL, "high", winner, "", note)], ["checked"])[0]
+        if child is None:
+            return winner
+        return self.select(pool, [child, winner], {winner.name}, 1, CHECK_ID + 20)[0]
+
     def fit_plan(self, steps: list[Step], module: Candidate) -> list[Step]:
-        """After round 1: if the planned rounds would not fit the budget at this module's size, use cheaper models, the
-        latest Sol xhigh rounds first (to Sol high), then the latest Astra rounds (to Sol xhigh), until the forecast fits."""
+        """After round 1: if the remaining rounds would not fit the budget at this module's size, use cheaper models, the
+        latest Astra rounds first (to Sol xhigh), then the latest Sol xhigh rounds (to Sol high), until the forecast fits."""
         tokens = module.visible_tokens or len(module.raw) / 3.2
         limit = CREDIT_LIMIT * (1 - SAFETY) - GUARD_HEADROOM
         plan = list(steps)
 
         def forecast() -> float:
-            return self.budget.credits + sum(round_cost(s.rewrites[0], tokens) for s in plan[1:PLANNED_ROUNDS] if s.rewrites)
+            return self.budget.credits + sum(round_cost(s.rewrites[0], tokens) for s in plan[1:self.plan_rounds or None] if s.rewrites)
 
         astra = [i for i in range(len(plan) - 1, 0, -1) if plan[i].rewrites and plan[i].rewrites[0][0] == ASTRA]
         xhigh = [i for i in range(len(plan) - 1, 0, -1) if plan[i].rewrites and plan[i].rewrites[0] == (SOL, "xhigh")]
-        order = xhigh + astra  # Astra rounds are kept as long as anything else can give way
+        order = xhigh + astra if self.astra_last else astra + xhigh
         for i in order:
             if forecast() <= limit:
                 break
             cheaper = (SOL, "xhigh") if plan[i].rewrites[0][0] == ASTRA else (SOL, "high")
             plan[i] = replace(plan[i], rewrites=(cheaper,))
+        self.planned = [s.rewrites[0] if s.rewrites else None for s in plan]
         return plan
+
+    def merged_pick(self, pool: ThreadPoolExecutor, drafts: list[Candidate], picked: Candidate) -> Candidate:
+        """A critique of every draft against the target, then one module merged from the best base and the two other drafts
+        with the most strengths. The pick itself when there is nothing to merge or the merge gives no valid module."""
+        if len(drafts) < 2:
+            return picked
+        labels = [chr(65 + i) for i in range(len(drafts))]
+        by = dict(zip(labels, drafts, strict=True))
+        image = lambda b: {"type": "input_image", "image_url": data_url(b), "detail": "high"}
+        content: list[dict[str, Any]] = [{"type": "input_text", "text": "TARGET:"}, self.target, *self.closeup]
+        for label, draft in by.items():
+            content += [{"type": "input_text", "text": f"CANDIDATE {label} FRONT VIEWS:"}, image(draft.front),
+                        {"type": "input_text", "text": f"CANDIDATE {label} GRID:"}, image(draft.sides)]
+        content.append({"type": "input_text", "text": prompts.CRITIQUE_USER})
+        reply = self.run_stage(pool, [Call(CRITIQUE_ID, SOL, prompts.CRITIQUE_SYSTEM, content, "medium", SELECT_MAX_OUTPUT,
+                                           text=prompts.critique_schema(labels))])[0]
+        try:
+            critique = json.loads(reply.output_text) if reply is not None else None
+            notes = {entry["label"]: entry for entry in critique["candidates"] if entry.get("label") in by}
+            base = critique["base"] if critique.get("base") in by else labels[drafts.index(picked)]
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return picked
+        others = sorted((label for label in labels if label != base), key=lambda label: -len(notes.get(label, {}).get("strengths", [])))[:2]
+
+        def block(label: str, role: str) -> str:
+            note = notes.get(label, {})
+            return (f"{role} MODULE (candidate {label})\nStrengths: " + "; ".join(note.get("strengths", [])) + "\nWeaknesses: "
+                    + "; ".join(note.get("weaknesses", [])) + f"\n```javascript\n{by[label].raw}\n```")
+
+        text = prompts.MERGE_PICK + "\n\n" + block(base, "BASE") + "".join("\n\n" + block(label, "OTHER") for label in others)
+        self.merge_base = by[base].name
+        call = Call(CRITIQUE_ID + 10, SOL, self.instructions, [{"type": "input_text", "text": text}, self.target, *self.closeup],
+                    "high", GENERATE_MAX_OUTPUT)
+        merged = self.modules(pool, [call], ["dm"])[0]
+        return merged if merged is not None else picked
+
+    def fit_rest(self, base: list[Step], index: int, module: Candidate) -> list[Step]:
+        """Before round `index` + 1: the fullest plan for the rounds left that the credits and calls left allow. From the plan
+        as written, these give way in order until every remaining call is forecast to pass the budget guard: merge calls
+        (latest round first, and never more than the calls left allow), Sol xhigh rounds to Sol high (latest first, down to
+        half of them), Astra rounds to Sol xhigh (latest first), then the other xhigh rounds. Rounds are not dropped here:
+        the guard refuses what still does not fit. Recomputed every round from the written plan, so room that cheaper
+        replies leave is used again."""
+        rest = list(base[index:])
+        spare = CALL_LIMIT - self.budget.calls - 3 * len(rest) - CALL_RESERVE
+        for i, step in enumerate(rest):
+            if step.merge:
+                need = 3 if step.judge_pick else 1  # with the judge pick a refused merge costs two more calls for the plain rewrite
+                if spare >= need:
+                    spare -= need
+                else:
+                    rest[i] = replace(step, merge=False)
+        chars = len(module.raw) * (1 + (MODULE_GROWTH - 1) * len(rest) / 9)
+        size = chars / MODULE_CHARS_PER_TOKEN
+        ratio = min(1.0, max(PATCH_FLOOR, sum(self.patch_ratios) / len(self.patch_ratios))) if self.patch_ratios else PATCH_PRIOR
+        usable = CREDIT_LIMIT * (1 - SAFETY) - self.end_reserve
+        text = int(len(self.instructions) + chars + len(prompts.REWRITE_PATCH) + 400)
+        judge = worst_case(SOL, 4000, 9, SELECT_MAX_OUTPUT)
+
+        def rewrite_cost(step: Step) -> float:
+            model, effort = step.rewrites[0]
+            reasoning, other = ROUND_COST.get((model, effort), ROUND_COST[(SOL, "xhigh")])
+            weights = PRICING["models"][model]
+            return (weights["input_credits_per_token"] * (other + size)
+                    + weights["output_credits_per_token"] * (reasoning + size * (ratio if step.patch else 1.0)))
+
+        weights = PRICING["models"][SOL]
+        merge_cost = weights["input_credits_per_token"] * (MERGE_COST[1] + 2 * size) + weights["output_credits_per_token"] * (MERGE_COST[0] + size)
+
+        def fits() -> bool:
+            spent = self.budget.credits
+            for step in rest:
+                if not step.rewrites:
+                    continue
+                model, effort = step.rewrites[0]
+                cap = self.astra_cap if model == ASTRA else EFFORT_MAX_OUTPUT.get(effort, GENERATE_MAX_OUTPUT)
+                if spent + worst_case(model, text, 7, cap) > usable:
+                    return False
+                spent += rewrite_cost(step)
+                if step.merge:
+                    if spent + worst_case(SOL, int(text + chars), 12, GENERATE_MAX_OUTPUT) > usable:
+                        return False
+                    spent += merge_cost
+                if spent + 2 * judge > usable:
+                    return False
+                spent += 2 * SELECT_CALL_CREDITS + (SELECT_EXTRA_CREDITS if step.merge else 0)
+            return True
+
+        merges = [i for i in range(len(rest) - 1, -1, -1) if rest[i].merge]
+        xhigh = [i for i in range(len(rest) - 1, -1, -1) if rest[i].rewrites and rest[i].rewrites[0] == (SOL, "xhigh")]
+        astra = [i for i in range(len(rest) - 1, -1, -1) if rest[i].rewrites and rest[i].rewrites[0][0] == ASTRA]
+        lowered = len(xhigh) // 2
+        moves = ([("merge", i) for i in merges] + [("high", i) for i in xhigh[:lowered]]
+                 + [("xhigh", i) for i in astra] + [("high", i) for i in xhigh[lowered:]])
+        for kind, i in moves:
+            if fits():
+                break
+            if kind == "merge":
+                rest[i] = replace(rest[i], merge=False)
+            else:
+                rest[i] = replace(rest[i], rewrites=((SOL, kind),))
+        return rest
+
+    def judge_gap(self, pool: ThreadPoolExecutor, first: Candidate, second: Candidate, request_id: int) -> float | None:
+        """The judge's first-stage question on the left view (first shown first) and the right view (second shown first):
+        the mean of first's penalty minus second's, so a positive value favours `second`. None with no usable reply."""
+        if len(first.shots) < 2 or len(second.shots) < 2:
+            return None
+        image = lambda b: {"type": "input_image", "image_url": data_url(b), "detail": "high"}
+        asks = ((first.shots[0], second.shots[0], "slightly left of the front", True),
+                (second.shots[1], first.shots[1], "slightly right of the front", False))
+        calls = [Call(request_id + offset, SOL, prompts.JUDGE_SYSTEM, [
+            {"type": "input_text", "text": "Reference image (target object):"}, self.target,
+            {"type": "input_text", "text": "3D model 1:"}, image(a),
+            {"type": "input_text", "text": "3D model 2:"}, image(b),
+            {"type": "input_text", "text": prompts.JUDGE_USER.format(angle_desc=angle)}], SELECT_EFFORT, JUDGE_MAX_OUTPUT,
+            text=prompts.judge_schema()) for offset, (a, b, angle, _) in enumerate(asks)]
+        gaps = []
+        for (_, _, _, first_shown_first), reply in zip(asks, self.run_stage(pool, calls), strict=True):
+            try:
+                answer = json.loads(reply.output_text) if reply is not None else None
+                one, two = float(answer["penalty_1"]), float(answer["penalty_2"])
+            except (ValueError, TypeError, KeyError, AttributeError):
+                continue
+            gaps.append(one - two if first_shown_first else two - one)
+        return sum(gaps) / len(gaps) if gaps else None
+
+    def checkpoint_pick(self, pool: ThreadPoolExecutor, final: Candidate, snaps: list[Candidate]) -> Candidate:
+        """The final module, or an earlier checkpoint when both the selector (by PARENT_MARGIN) and the judge copy (by its
+        draw threshold) clearly prefer it."""
+        earlier, seen = [], {final.source}
+        for candidate in reversed(snaps):
+            if candidate.source not in seen:
+                seen.add(candidate.source)
+                earlier.append(candidate)
+        if not earlier:
+            return final
+        judgements = self.scores(pool, [final, *earlier], CHECKPOINT_ID)
+        mine = judgements.get(final.name)
+        scored = [c for c in earlier if judgements.get(c.name) is not None]
+        if mine is None or not scored:
+            return final
+        best = min(scored, key=lambda c: judgements[c.name].score)
+        if judgements[best.name].score + PARENT_MARGIN > mine.score:
+            return final
+        gap = self.judge_gap(pool, final, best, CHECKPOINT_ID + 2)
+        return best if gap is not None and gap > JUDGE_DRAW else final
+
+    def judge_pick(self, pool: ThreadPoolExecutor, parent: Candidate, child: Candidate, request_id: int) -> bool:
+        """Whether the child is kept: the judge's first-stage question on the left view (parent shown first) and on the right
+        view (child shown first). The child stays unless the parent's mean penalty is lower by more than the judge's draw
+        threshold; with no usable reply the parent stays."""
+        if len(parent.shots) < 2 or len(child.shots) < 2:
+            return False
+        image = lambda b: {"type": "input_image", "image_url": data_url(b), "detail": "high"}
+        asks = ((parent.shots[0], child.shots[0], "slightly left of the front", True),
+                (child.shots[1], parent.shots[1], "slightly right of the front", False))
+        calls = [Call(request_id + offset, SOL, prompts.JUDGE_SYSTEM, [
+            {"type": "input_text", "text": "Reference image (target object):"}, self.target,
+            {"type": "input_text", "text": "3D model 1:"}, image(first),
+            {"type": "input_text", "text": "3D model 2:"}, image(second),
+            {"type": "input_text", "text": prompts.JUDGE_USER.format(angle_desc=angle)}], SELECT_EFFORT, JUDGE_MAX_OUTPUT,
+            text=prompts.judge_schema()) for offset, (first, second, angle, _) in enumerate(asks)]
+        gaps = []  # the parent's penalty minus the child's, per reply
+        for (_, _, _, parent_first), reply in zip(asks, self.run_stage(pool, calls), strict=True):
+            try:
+                answer = json.loads(reply.output_text) if reply is not None else None
+                one, two = float(answer["penalty_1"]), float(answer["penalty_2"])
+            except (ValueError, TypeError, KeyError, AttributeError):
+                continue
+            gaps.append(one - two if parent_first else two - one)
+        return bool(gaps) and sum(gaps) / len(gaps) >= -JUDGE_DRAW
+
+    def feedback(self, step: Step, parent: Candidate) -> str:
+        """Extra text for a rewrite: the selector's fixes for the parent and the earlier rounds, when the step asks for them."""
+        extra = ""
+        if step.feed_fixes and parent.fixes:
+            extra += prompts.FIXES_BLOCK.format(fixes="\n".join(f"- {fix}" for fix in parent.fixes))
+        if step.feed_diffs and self.changes:
+            lines = []
+            for index, change, kept in self.changes[-4:]:
+                outcome = "kept" if kept else "rejected, so the module before it was kept"
+                lines.append(f"- Round {index + 1}, {outcome}:\n{change}")
+            extra += prompts.CHANGES_BLOCK.format(changes="\n".join(lines))
+        if step.feed_history and self.history:
+            lines = []
+            for index, notes, kept in self.history[-4:]:
+                bullets = [line.strip(" -*\t") for line in notes.splitlines() if line.strip(" -*\t")][:5]
+                outcome = "kept" if kept else "rejected, so the module before it was kept"
+                lines.append(f"- Round {index + 1}, {outcome}: " + " / ".join(bullets)[:400])
+            extra += prompts.HISTORY_BLOCK.format(history="\n".join(lines))
+        return extra
+
+    def fits(self, call: Call) -> bool:
+        """Whether the budget would admit this call now."""
+        text_chars = len(call.instructions) + sum(len(c.get("text", "")) for c in call.content)
+        images = sum(1 for c in call.content if c["type"] == "input_image")
+        return self.budget.allows([worst_case(call.model, text_chars, images, call.max_output_tokens)])
 
     def run_stage(self, pool: ThreadPoolExecutor, calls: list[Call]) -> list[Response | None]:
         """Reserve budget for every call (main thread, fixed order), then dispatch them concurrently."""
@@ -689,28 +1031,33 @@ class Pipeline:
 
     def module_call(self, request_id: int, model: str, effort: str, extra: list[dict[str, Any]],
                     start: str = "plain") -> Call:
-        target = prompts.TARGET_PROPORTIONS if start == "proportions" else prompts.TARGET
+        target = prompts.TARGET_INVENTORY if start == "inventory" else prompts.TARGET_PROPORTIONS if start == "proportions" else prompts.TARGET
         if self.brief and not extra:
             target = f"{target}\n\n{self.brief}"
         content = [{"type": "input_text", "text": target}, self.target, *self.closeup, *extra]
         cap = self.astra_cap if model == ASTRA else EFFORT_MAX_OUTPUT.get(effort, GENERATE_MAX_OUTPUT)
         return Call(request_id, model, self.instructions, content, effort, cap)
 
-    def rewrite_call(self, request_id: int, model: str, effort: str, parent: Candidate, focus: str = "") -> Call:
+    def rewrite_call(self, request_id: int, model: str, effort: str, parent: Candidate, focus: str = "", extra: str = "",
+                     patch_edit: bool = False) -> Call:
         views = [{"type": "input_image", "image_url": data_url(view), "detail": "high"} for view in parent.views]
         if self.photo is not None or self.brief:
             overlay = [{"type": "input_image", "image_url": data_url(parent.overlay), "detail": "low"}] if parent.overlay else []
-            text = prompts.REWRITE_MEASURED.format(source=parent.raw, focus=prompts.REWRITE_FOCUS[focus], brief=self.brief,
+            text = prompts.REWRITE_MEASURED.format(source=parent.raw, focus=prompts.REWRITE_FOCUS[focus] + extra, brief=self.brief,
                                                  measurements=parent.measurements)
             return self.module_call(request_id, model, effort, [
                 *views, {"type": "input_image", "image_url": data_url(parent.sides), "detail": "high"}, *overlay,
                 {"type": "input_text", "text": text}])
-        return self.module_call(request_id, model, effort, [
+        call = self.module_call(request_id, model, effort, [
             {"type": "input_text", "text": "Current module, in order: 30 degrees left, 30 degrees right, from slightly below, from above; then the second-stage grid."},
             *views,
             {"type": "input_image", "image_url": data_url(parent.sides), "detail": "high"},
-            {"type": "input_text", "text": prompts.REWRITE.format(source=parent.raw, focus=prompts.REWRITE_FOCUS[focus])},
+            {"type": "input_text", "text": (prompts.REWRITE_PATCH if patch_edit else prompts.REWRITE).format(
+                source=parent.raw, focus=prompts.REWRITE_FOCUS[focus] + extra)},
         ])
+        if patch_edit and self.instructions == prompts.GENERATE_CHAIN:
+            call.instructions = prompts.GENERATE_CHAIN_PATCH
+        return call
 
     # ----- rendering -----
 
@@ -769,21 +1116,33 @@ class Pipeline:
         except RenderRejected as rejection:
             return source, rejection.detail_json
         candidate = Candidate(name, source, view_sheet(views), grid, raw, views)
+        if self.keep_shots:
+            candidate.shots = judge_shots(front)[:2]
         if self.photo is not None:
             candidate.match = match.grid_score(front, self.photo)
             candidate.measurements, candidate.overlay = match.feedback(front, self.photo)
         return candidate
 
-    def modules(self, pool: ThreadPoolExecutor, calls: list[Call], names: list[str]) -> list[Candidate | None]:
+    def modules(self, pool: ThreadPoolExecutor, calls: list[Call], names: list[str],
+                bases: dict[int, str] | None = None) -> list[Candidate | None]:
         """Run calls as one stage and render the replies in order; rejected modules get one repair in a second stage."""
         results: list[Candidate | None] = [None] * len(calls)
         rejected: list[tuple[int, str, str]] = []
         for index, reply in enumerate(self.run_stage(pool, calls)):
-            raw = extract_source(reply.output_text) if reply is not None else None
+            if reply is not None and bases is not None and index in bases:
+                applied = patch.apply(bases[index], reply.output_text, extract_source)
+                raw = applied.code if applied.code is not None and _EXPORT.search(applied.code) else None
+                self.patch_log.append({"name": names[index], "applied": applied.applied, "skipped": len(applied.skipped),
+                                       "full": applied.full, "used": raw is not None})
+                if raw is not None:
+                    self.patch_ratios.append(1.0 if applied.full else _visible_tokens(reply) / max(1.0, len(bases[index]) / MODULE_CHARS_PER_TOKEN))
+            else:
+                raw = extract_source(reply.output_text) if reply is not None else None
             if raw is None:
                 continue
             outcome = self.render_module(names[index], normalize(raw, self.wrapper), raw)
             if isinstance(outcome, Candidate):
+                outcome.notes = reply.output_text.split("```")[0].strip()[:2000]
                 outcome.visible_tokens = _visible_tokens(reply)
                 results[index] = outcome
             else:
@@ -911,7 +1270,11 @@ class Pipeline:
                 ]
             calls.append(Call(request_id + offset, SOL, instructions, content, SELECT_EFFORT, SELECT_MAX_OUTPUT,
                               text=prompts.select_close_schema(list(labels))))
-        return self.parse_judgement(labels, self.run_stage(pool, calls))
+        judgements = self.parse_judgement(labels, self.run_stage(pool, calls))
+        for candidate in candidates:
+            if candidate.name in judgements:
+                candidate.fixes = judgements[candidate.name].fixes
+        return judgements
 
     def select(self, pool: ThreadPoolExecutor, candidates: list[Candidate], parents: set[str], keep: int,
                request_id: int) -> list[Candidate]:
@@ -986,6 +1349,10 @@ class Pipeline:
 
     def run_stages(self, plan: StagePlan) -> str:
         self.wrapper = chain_wrapper(plan.fill, plan.glow, plan.outline_fit or plan.measured)
+        self.level_tilt = plan.level_tilt
+        self.keep_shots = any(step.judge_pick for step in plan.steps) or plan.second_look or bool(plan.narrow_after) or bool(plan.checkpoints)
+        self.second_look, self.merge_tie = plan.second_look, plan.merge_tie
+        self.end_reserve = 2 * (plan.judged_tilt + plan.judged_turn) * worst_case(SOL, 4000, 11, SELECT_MAX_OUTPUT)
         closeup = object_closeup(self.image)
         if closeup is not None:
             self.closeup = [{"type": "input_image", "image_url": data_url(closeup), "detail": "high"}]
@@ -1006,24 +1373,58 @@ class Pipeline:
                 return fallback_module(self.image)
             self.best_so_far = survivors[0].source
             if plan.draft_keep:
+                drafts = survivors
                 survivors = self.drafts_kept(pool, survivors, plan)
+                if plan.merge_pick:
+                    survivors = [self.merged_pick(pool, drafts, survivors[0]), *survivors[1:]]
                 self.best_so_far = survivors[0].source
             searched = False
             steps = list(plan.steps)
+            snaps: list[Candidate] = []
             for index in range(len(steps)):
-                survivors = self.advance(pool, survivors, steps[index], index)
+                if plan.replan and index:
+                    steps[index:] = self.fit_rest(list(plan.steps), index, survivors[0])
+                step = steps[index]
+                survivors = self.advance(pool, survivors, step, index)
                 if plan.budget_plan and index == 0:
+                    self.astra_last = plan.astra_last
+                    self.plan_rounds = plan.plan_rounds
                     steps = self.fit_plan(steps, survivors[0])
                 self.best_so_far = survivors[0].source
                 if plan.measured and len(survivors) == 1 and not searched:  # once only: the Pod has one render slot
                     survivors[0], searched = self.posed_by_search(pool, survivors[0]), True
+                if plan.narrow_after and index + 1 == plan.narrow_after and len(survivors) > 1:
+                    gap = self.judge_gap(pool, survivors[0], survivors[1], NARROW_ID)
+                    survivors = [survivors[1] if gap is not None and gap > JUDGE_DRAW else survivors[0]]
+                    self.best_so_far = survivors[0].source
+                if index + 1 in plan.checkpoints and len(survivors) == 1:
+                    snaps.append(survivors[0])
+            if plan.checkpoints and snaps and len(survivors) == 1:
+                survivors = [self.checkpoint_pick(pool, survivors[0], snaps)]
+                self.best_so_far = survivors[0].source
             winner = self.select(pool, survivors, set(), 1, FINAL_SELECT_ID)[0]
             self.best_so_far = winner.source
+            for index in range(len(plan.steps), len(plan.steps) + plan.post_pick_steps):
+                kept = self.post_pick(pool, winner, index, plan.post_pick_effort)
+                if kept is None:  # the budget refused the rewrite or it gave no valid module: nothing is scored, no more steps
+                    break
+                winner = kept
+                self.best_so_far = winner.source
+            if plan.check:
+                winner = self.checked(pool, winner)
+                self.best_so_far = winner.source
             final = self.posed(pool, winner) if plan.pose and not plan.measured else winner
             source = self.stronger_metal(self.photo_tilted(self.fitted_last(winner, plan)) if plan.outline_fit_last and final is winner else final.source)
-            self.best_so_far = source
-            source = self.judged_tilt(pool, source)
-            source = self.toned(source)
+            if plan.judged_tilt:
+                self.best_so_far = source
+                source = self.judged_tilt(pool, source)
+            if plan.judged_turn:
+                self.best_so_far = source
+                source = self.judged_turn(pool, source)
+            if plan.tone:
+                source = self.toned(source)
+            if plan.forward:
+                source = self.pushed_forward(source)
             return source
 
     def photo_tilted(self, source: str) -> str:
@@ -1032,11 +1433,42 @@ class Pipeline:
             angle = tilt.best_tilt(self.image, source, lambda s: self.renderer.render(s, LEVEL_VIEW))
             if angle is None:
                 return source
-            turned = tilt.tilted(source, angle)
+            turned = tilt.tilted_if_flat(source, angle) if self.level_tilt else tilt.tilted(source, angle)
             self.renderer.render(turned, FRONT_JUDGE)
         except RenderRejected:
             return source
         return turned
+
+    def judged_turn(self, pool: ThreadPoolExecutor, source: str) -> str:
+        """The finished module turned about its vertical axis if the pose selector clearly prefers that: the module as it
+        is, and turned 30 degrees left and right before its tilt, scored together in both orders."""
+        lines = _TILT_LINES.findall(source)
+        if len(lines) != 1:
+            return source
+        variants = {"finished": source}
+        for angle in TURN_CHOICES:
+            variants[f"turn{angle}"] = source.replace(lines[0], f"{lines[0]}\n  root.rotation.y += {angle} * Math.PI / 180;", 1)
+        candidates: list[Candidate] = []
+        seen: set[str] = set()
+        for name, text in variants.items():
+            outcome = self.render_module(name, text)
+            if not isinstance(outcome, Candidate):
+                continue
+            key = hashlib.sha256(outcome.front + outcome.sides).hexdigest()
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(outcome)
+        if len(candidates) < 2 or candidates[0].name != "finished":
+            return source
+        judgements = self.scores(pool, candidates, TURN_SELECT_ID, prompts.SELECT_POSE)
+        current = judgements.get("finished")
+        if current is None:
+            return source
+        best = min((c for c in candidates if c.name in judgements), key=lambda c: (judgements[c.name].score, c.name != "finished"))
+        if best.name != "finished" and judgements[best.name].score + TILT_MARGIN <= current.score:
+            return best.source
+        return source
 
     def judged_tilt(self, pool: ThreadPoolExecutor, source: str) -> str:
         """The finished module at the tilt the pose selector prefers: the module as finished, and turned 0, 20 and 40
@@ -1074,6 +1506,18 @@ class Pipeline:
         turned = tone(source)
         if turned == source:
             return source
+        try:
+            self.renderer.render(turned, FRONT_JUDGE)
+        except RenderRejected:
+            return source
+        return turned
+
+    def pushed_forward(self, source: str) -> str:
+        """The finished object moved to the front face of the unit cube; as it is when the renderer refuses."""
+        at = source.rfind(_CENTERED)
+        if at < 0:
+            return source
+        turned = source[:at] + _FORWARD + source[at + len(_CENTERED):]
         try:
             self.renderer.render(turned, FRONT_JUDGE)
         except RenderRejected:
@@ -1141,11 +1585,17 @@ class Pipeline:
         return outcome if offered.score - MATCH_WEIGHT * outcome.match + PARENT_MARGIN <= now else incumbent
 
     def drafts_kept(self, pool: ThreadPoolExecutor, drafts: list[Candidate], plan: StagePlan) -> list[Candidate]:
+        if plan.merge_beam:
+            merged = self.beam_merge(pool, drafts, CRITIQUE_ID, "bm0")
+            if merged is not None:
+                drafts = [*drafts, merged]
         ordered = self.select(pool, drafts, set(), len(drafts) - 1 if plan.draft_each_start and len(drafts) > plan.draft_keep else plan.draft_keep, SELECT_ID)
         if not plan.draft_each_start or len(drafts) <= plan.draft_keep:
             return ordered
         kept, starts = [], set()
         for draft in ordered:
+            if not (draft.name[:1] == "d" and draft.name[1:].isdigit()):
+                continue  # a merged module enters only by rank, below
             start = plan.drafts[int(draft.name[1:])].start
             if start not in starts:
                 starts.add(start)
@@ -1159,36 +1609,135 @@ class Pipeline:
             parents = [c.parent for c in survivors if c.parent is not None]
             return self.select(pool, [*survivors, *parents], {p.name for p in parents}, step.keep or 1, select_id)
         calls, names, owners = [], [], []
+        bases: dict[int, str] = {}
         for position, parent in enumerate(survivors):
             rewrites = (step.lineage[position % len(step.lineage)],) if step.lineage else step.rewrites
             focus = step.focus[position % len(step.focus)] if step.focus else ""
             for number, (model, effort) in enumerate(rewrites):
                 request_id = REWRITE_BASE * (index + 1) + 10 * position + number
-                calls.append(self.rewrite_call(request_id, model, effort, parent, focus))
+                if step.feed_fixes and not parent.fixes:
+                    parent.fixes = self.reviewed(pool, parent, REVIEW_ID + 10 * (index + 1) + position)
+                extra = self.feedback(step, parent) + step.nudge
+                call = self.rewrite_call(request_id, model, effort, parent, focus, extra, step.patch)
+                if step.fallback and not self.fits(call):
+                    call = self.rewrite_call(request_id, *step.fallback, parent, focus, extra, step.patch)
+                if step.patch:
+                    bases[len(calls)] = parent.raw
+                calls.append(call)
                 names.append(f"r{index}.{position}.{number}")
                 owners.append(position)
-        children = self.modules(pool, calls, names)
+        children = self.modules(pool, calls, names, bases if step.patch else None)
         for owner, child in zip(owners, children, strict=True):
             if child is not None:
                 child.parent = survivors[owner]
-        if step.each_lineage:
-            judgements = self.scores(pool, [*[c for c in children if c is not None], *survivors], select_id)
+        if step.each_lineage and step.pair_merge and len(survivors) == 1:
+            parent = survivors[0]
+            valid = [child for child in children if child is not None]
+            offered = list(valid)
+            if len(valid) == 2:
+                merged = self.modules(pool, [self.merge_two_call(REWRITE_BASE * (index + 1) + 50, valid[0], valid[1])], [f"m{index}.0"])[0]
+                if merged is not None:
+                    merged.parent = parent
+                    offered.append(merged)
+            if not offered:
+                return survivors
+            judgements = self.scores(pool, [*offered, parent], select_id)
+            kept = parent
+            scored = [c for c in offered if judgements.get(c.name) is not None]
+            mine = judgements.get(parent.name)
+            if scored and mine is not None:
+                ranked = sorted(scored, key=lambda c: judgements[c.name].score)
+                best = ranked[0]
+                if self.merge_tie:
+                    merge = next((c for c in scored if c.name.startswith("m")), None)
+                    if merge is not None and judgements[merge.name].score <= judgements[best.name].score + PARENT_MARGIN:
+                        best = merge
+                if (self.second_look and best is ranked[0] and len(ranked) > 1
+                        and judgements[ranked[1].name].score <= judgements[best.name].score + PARENT_MARGIN):
+                    gap = self.judge_gap(pool, best, ranked[1], select_id + 4)
+                    if gap is not None and gap > JUDGE_DRAW:
+                        best = ranked[1]
+                if judgements[best.name].score <= mine.score + PARENT_MARGIN:
+                    kept = best
+            for child in valid:
+                self.history.append((index, child.notes, kept is child))
+                self.changes.append((index, code_changes(parent.raw, child.raw), kept is child))
+            return [kept]
+        if step.each_lineage and step.judge_pick:
+            blended: list[Candidate | None] = [None] * len(children)
+            if step.merge:  # one module from the parent and its rewrite; it is offered first, the plain rewrite only if it fails
+                mcalls, mnames, mslots = [], [], []
+                for k, (owner, child) in enumerate(zip(owners, children, strict=True)):
+                    if child is not None:
+                        mcalls.append(self.merge_call(REWRITE_BASE * (index + 1) + 50 + 10 * owner, survivors[owner], child))
+                        mnames.append(f"m{index}.{owner}"); mslots.append(k)
+                for k, candidate in zip(mslots, self.modules(pool, mcalls, mnames) if mcalls else [], strict=True):
+                    if candidate is not None:
+                        candidate.parent = survivors[owners[k]]
+                        blended[k] = candidate
             kept = list(survivors)
-            for owner, child in zip(owners, children, strict=True):
-                if child is None:
+            for k, (owner, child) in enumerate(zip(owners, children, strict=True)):
+                if child is not None:
+                    for turn, offer in enumerate(c for c in (blended[k], child) if c is not None):
+                        if self.judge_pick(pool, survivors[owner], offer, select_id + 2 * owner + 2 * len(survivors) * turn):
+                            kept[owner] = offer
+                            break
+                    self.history.append((index, child.notes, kept[owner] is not survivors[owner]))
+                    self.changes.append((index, code_changes(survivors[owner].raw, child.raw), kept[owner] is not survivors[owner]))
+            return kept
+        if step.each_lineage:
+            merged: list[Candidate | None] = [None] * len(children)
+            if step.merge:
+                mcalls, mnames, mslots = [], [], []
+                for k, (owner, child) in enumerate(zip(owners, children, strict=True)):
+                    if child is not None:
+                        mcalls.append(self.merge_call(REWRITE_BASE * (index + 1) + 50 + 10 * owner, survivors[owner], child))
+                        mnames.append(f"m{index}.{owner}"); mslots.append(k)
+                for k, candidate in zip(mslots, self.modules(pool, mcalls, mnames) if mcalls else [], strict=True):
+                    if candidate is not None:
+                        candidate.parent = survivors[owners[k]]
+                        merged[k] = candidate
+            offered = [c for c in children if c is not None] + [m for m in merged if m is not None]
+            judgements = self.scores(pool, [*offered, *survivors], select_id)
+            kept = list(survivors)
+            for k, (owner, child) in enumerate(zip(owners, children, strict=True)):
+                offers = [c for c in (child, merged[k]) if c is not None and judgements.get(c.name) is not None]
+                if not offers:
                     continue
-                mine, parent = judgements.get(child.name), judgements.get(survivors[owner].name)
-                if mine is not None and parent is not None and mine.score <= parent.score + PARENT_MARGIN:
-                    kept[owner] = child
+                best = min(offers, key=lambda c: judgements[c.name].score)
+                mine, parent = judgements[best.name], judgements.get(survivors[owner].name)
+                if parent is not None and mine.score <= parent.score + PARENT_MARGIN and not (step.tie_parent and mine.score == parent.score):
+                    kept[owner] = best
+            for owner, child in zip(owners, children, strict=True):
+                if child is not None:
+                    self.history.append((index, child.notes, kept[owner] is child))
+                    self.changes.append((index, code_changes(survivors[owner].raw, child.raw), kept[owner] is child))
             return kept
         if step.keep:
             valid = [child for child in children if child is not None]
+            if step.merge:
+                merged = self.beam_merge(pool, [*valid, *survivors], CRITIQUE_ID + 20 * (index + 1), f"bm{index + 1}")
+                if merged is not None:
+                    valid.append(merged)
             return self.select(pool, [*valid, *survivors], {c.name for c in survivors}, step.keep, select_id)
         newest = list(survivors)
         for owner, child in zip(owners, children, strict=True):
             if child is not None:
                 newest[owner] = child
         return newest
+
+    def post_pick(self, pool: ThreadPoolExecutor, winner: Candidate, index: int, effort: str = "xhigh") -> Candidate | None:
+        """One more rewrite of the final pick, judged against it as in an each_lineage step: the child is kept unless the
+        parent leads by PARENT_MARGIN. None when the budget refuses the rewrite or it yields no valid module: nothing is scored."""
+        model = POST_PICK_REWRITE[0]
+        call = self.rewrite_call(REWRITE_BASE * (index + 1), model, effort, winner)
+        child = self.modules(pool, [call], [f"r{index}.0.0"])[0]
+        if child is None:
+            return None
+        child.parent = winner
+        judgements = self.scores(pool, [child, winner], SELECT_ID + 10 * (index + 1))
+        mine, parent = judgements.get(child.name), judgements.get(winner.name)
+        return child if mine is not None and parent is not None and mine.score <= parent.score + PARENT_MARGIN else winner
 
     def posed(self, pool: ThreadPoolExecutor, incumbent: Candidate) -> Candidate:
         """Offer other poses to the selector: the photo-matching quarter turn, and standing a flat object up."""
@@ -1257,9 +1806,8 @@ def run(image: bytes, seed: int, calls: ModelCalls, renderer: Renderer, plan: Pl
 # Mean reasoning tokens and input tokens besides the module, per rewrite type.
 ROUND_COST = {("gpt-6-astra", "high"): (494, 10313), ("gpt-6.1-sol", "xhigh"): (10712, 9125), ("gpt-6.1-sol", "high"): (748, 9575)}
 SELECT_CALL_CREDITS = 15731
-MODULE_GROWTH = 1.15  # modules grow over the rounds
-GUARD_HEADROOM = 300_000  # the guard reserves the worst case before each call, above a last round's expected cost
-PLANNED_ROUNDS = None  # None: every round of the plan is fitted; N: only the first N, later ones run when the guard admits them
+MODULE_GROWTH = 1.15
+GUARD_HEADROOM = 300_000  # the guard reserves the worst case before each call, about 0.3M above a last round's expected cost  # modules grow over the rounds; this brings the forecast to the measured median
 
 
 def round_cost(rewrite: tuple[str, str], tokens: float) -> float:
@@ -1272,17 +1820,13 @@ def round_cost(rewrite: tuple[str, str], tokens: float) -> float:
             + 2 * SELECT_CALL_CREDITS)
 
 
-def _visible_tokens(reply: object) -> int:
-    usage = getattr(reply, "usage", None)
-    if usage is None:
-        return 0
-    get = (lambda obj, key: obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None))
-    out = get(usage, "output_tokens") or 0
-    details = get(usage, "output_tokens_details")
-    reasoning = (get(details, "reasoning_tokens") or 0) if details is not None else 0
-    return max(0, int(out) - int(reasoning))
-
-
+MODULE_CHARS_PER_TOKEN = 2.85  # module code, measured on rewrite replies
+PATCH_FLOOR = 0.4  # the least a patch-edit reply is taken to cost, as a share of the whole module
+PATCH_PRIOR = 0.6  # that share before any patch-edit reply of this prompt has been seen
+MERGE_COST = (748, 11000)  # a round's merge call: reasoning tokens, and input tokens besides the two modules
+SELECT_EXTRA_CREDITS = 12000  # a third candidate in the round's two selection calls
+_CENTERED = "    root.position.set(-center.x * scale, -center.y * scale, -center.z * scale);\n"
+_FORWARD = "    root.position.set(-center.x * scale, -center.y * scale, -center.z * scale + Math.max(0, 0.4995 - size.z * scale / 2));\n"
 # Display-space tone on material colours, base-colour textures, vertex and instance colours, before the final fit.
 TONE_CALL = '__col404(THREE, root, {"cont":1.1,"vib":0.1,"bri":-0.015});'
 TONE_FUNCTION = r"""
@@ -1338,9 +1882,42 @@ function __col404(THREE, root, c) {
 """
 
 
+def judge_shots(front: bytes) -> list[bytes]:
+    """The four front views as the judge sees them: the tiles of the gap-free front render, uncropped."""
+    image = Image.open(io.BytesIO(front)).convert("RGB")
+    width, height = image.size
+    shots = []
+    for x, y in ((0, 0), (width // 2, 0), (0, height // 2), (width // 2, height // 2)):
+        buffer = io.BytesIO()
+        image.crop((x, y, x + width // 2, y + height // 2)).save(buffer, "PNG")
+        shots.append(buffer.getvalue())
+    return shots
+
+
 def tone(source: str) -> str:
     at = source.rfind(_FIT)
     if at < 0 or _EXPORT_LINE not in source:
         return source
     source = source[:at] + "  " + TONE_CALL + "\n" + source[at:]
     return source.replace(_EXPORT_LINE, TONE_FUNCTION + "\n" + _EXPORT_LINE, 1)
+
+
+def _visible_tokens(reply: object) -> int:
+    usage = getattr(reply, "usage", None)
+    if usage is None:
+        return 0
+    get = (lambda obj, key: obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None))
+    out = get(usage, "output_tokens") or 0
+    details = get(usage, "output_tokens_details")
+    reasoning = (get(details, "reasoning_tokens") or 0) if details is not None else 0
+    return max(0, int(out) - int(reasoning))
+
+
+def code_changes(old: str, new: str, limit: int = 10) -> str:
+    """The changed code lines from old to new (removed with -, added with +), at most `limit`, each shortened."""
+    lines = [line for line in difflib.unified_diff(old.splitlines(), new.splitlines(), lineterm="", n=0)
+             if line[:1] in "+-" and not line.startswith(("+++", "---")) and line[1:].strip()]
+    shown = [f"  {line[0]} {line[1:].strip()[:110]}" for line in lines[:limit]]
+    if len(lines) > limit:
+        shown.append(f"  ... and {len(lines) - limit} more changed lines")
+    return "\n".join(shown) if shown else "  (no code change)"

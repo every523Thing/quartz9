@@ -31,6 +31,11 @@ def tilted(source: str, angle: int) -> str:
     return source.replace(TILT_LINE, f"root.rotation.x = {angle} * Math.PI / 180;")
 
 
+def tilted_if_flat(source: str, angle: int) -> str:
+    """The tilt for flat objects only: anything taller stays level, as the fixed front views read it better."""
+    return source.replace(TILT_LINE, TILT_LINE.replace("= 15 *", f"= {angle} *"))
+
+
 def best_tilt(image: bytes, source: str, render: Callable[[str], bytes]) -> int | None:
     """The angle to use, or None to leave the module alone: no usable photo outline, or no clear gain."""
     if source.count(TILT_LINE) != 1:
